@@ -6,8 +6,6 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-
-
 def side_of_line(p, a, b):
     """
         > 0  -> bir tərəf
@@ -17,7 +15,16 @@ def side_of_line(p, a, b):
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
 
+def crossed_segment(prev_p, cur_p, a, b):
+    o1 = side_of_line(prev_p, a, b)
+    o2 = side_of_line(cur_p, a, b)
+    o3 = side_of_line(a, prev_p, cur_p)
+    o4 = side_of_line(b, prev_p, cur_p)
+    return ((o1 > 0) != (o2 > 0)) and ((o3 > 0) != (o4 > 0))
+
+
 def color_for_id(track_id):
+    """Hər ID üçün sabit rəng."""
     rng = np.random.RandomState(track_id)
     return tuple(int(c) for c in rng.randint(60, 255, 3))
 
@@ -35,8 +42,13 @@ def parse_args():
     parser.add_argument("--line", type=int, nargs=4, default=None,
                         metavar=("X1", "Y1", "X2", "Y2"),
                         help="Sayğac xəttinin koordinatları (piksel). Verilməsə, ortada üfüqi xətt.")
+    parser.add_argument("--cooldown", type=int, default=15,
+                        help="Eyni ID-nin təkrar sayılması üçün minimum kadr fasiləsi")
+    parser.add_argument("--forget", type=int, default=150,
+                        help="Bu qədər kadr görünməyən ID yaddaşdan silinir")
     parser.add_argument("--save", default=None, help="Nəticə videosunu bu fayla yaz")
-    parser.add_argument("--no-show", action="store_true", help="Pəncərə açma (serverdə faydalıdır)")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Pəncərə açma (serverdə faydalıdır)")
     return parser.parse_args()
 
 
@@ -44,7 +56,6 @@ def main():
     args = parse_args()
 
     source = int(args.source) if args.source.isdigit() else args.source
-
     model = YOLO(args.model)
 
     cap = cv2.VideoCapture(source)
@@ -66,17 +77,23 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(args.save, fourcc, src_fps, (width, height))
 
-    trails = defaultdict(lambda: deque(maxlen=30))  
-    last_side = {}                                 
-    count_ab = 0                                 
-    count_ba = 0                                    
+    # --- Vəziyyət (state) ---
+    trails = defaultdict(lambda: deque(maxlen=30))  # son 30 mövqeyi
+    last_point = {}       
+    last_seen = {}        
+    last_counted = {}     
+    count_ab = 0
+    count_ba = 0
 
+    frame_idx = 0
     prev_time = time.time()
 
     while True:
         ok, frame = cap.read()
         if not ok:
-            break  
+            break
+        frame_idx += 1
+
         results = model.track(
             frame,
             persist=True,
@@ -89,10 +106,10 @@ def main():
         boxes = results.boxes
 
         if boxes is not None and boxes.id is not None:
-            xyxy = boxes.xyxy.cpu().numpy()        
-            ids = boxes.id.int().cpu().tolist()     
-            classes = boxes.cls.int().cpu().tolist() 
-            confs = boxes.conf.cpu().tolist()      
+            xyxy = boxes.xyxy.cpu().numpy()
+            ids = boxes.id.int().cpu().tolist()
+            classes = boxes.cls.int().cpu().tolist()
+            confs = boxes.conf.cpu().tolist()
 
             for (bx1, by1, bx2, by2), tid, cls_id, conf in zip(xyxy, ids, classes, confs):
                 bx1, by1, bx2, by2 = int(bx1), int(by1), int(bx2), int(by2)
@@ -100,19 +117,22 @@ def main():
 
                 foot = (int((bx1 + bx2) / 2), by2)
                 trails[tid].append(foot)
+                last_seen[tid] = frame_idx
 
-                side = side_of_line(foot, line_a, line_b)
-                sign = 1 if side > 0 else (-1 if side < 0 else 0)
+                # --- Xətti keçmə məntiqi (yeni) ---
+                if tid in last_point:
+                    if crossed_segment(last_point[tid], foot, line_a, line_b):
+                        # Cooldown: bu ID yaxınlarda sayılıbsa, təkrar saymırıq
+                        if frame_idx - last_counted.get(tid, -10**9) >= args.cooldown:
+                            # İstiqamət: indiki nöqtənin xəttə görə tərəfi
+                            if side_of_line(foot, line_a, line_b) > 0:
+                                count_ab += 1
+                            else:
+                                count_ba += 1
+                            last_counted[tid] = frame_idx
+                last_point[tid] = foot
 
-                if sign != 0:
-                    prev = last_side.get(tid)
-                    if prev is not None and prev != sign:
-                        if sign > 0:
-                            count_ab += 1
-                        else:
-                            count_ba += 1
-                    last_side[tid] = sign
-
+                # --- Çəkmə ---
                 cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, 2)
                 label = f"{model.names[cls_id]} #{tid} {conf:.2f}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -124,6 +144,14 @@ def main():
                 if len(pts) > 1:
                     cv2.polylines(frame, [pts], False, color, 2)
                 cv2.circle(frame, foot, 4, color, -1)
+
+        if frame_idx % 60 == 0:
+            stale = [t for t, seen in last_seen.items() if frame_idx - seen > args.forget]
+            for t in stale:
+                last_seen.pop(t, None)
+                last_point.pop(t, None)
+                last_counted.pop(t, None)
+                trails.pop(t, None)
 
         cv2.line(frame, line_a, line_b, (0, 255, 255), 2)
 
